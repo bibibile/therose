@@ -11,10 +11,30 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""      # tg通知 chat_id id
 
 BASE_URL = "https://client.therose.cloud/login"
 
+# logo 图片路径（和脚本放在同一目录下，文件名 logo.png，仓库里需要提交这个文件）
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+
+# --- 代理配置（由工作流 shell 脚本写入 $GITHUB_ENV）---
+IS_PROXY = os.environ.get('IS_PROXY', 'false').lower() == 'true'
+PROXY_SERVER = os.environ.get('PROXY_SERVER') or "socks5://127.0.0.1:1080"
+REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
+
 # 检查必要变量
 if not EMAIL or not PASSWORD:
     print("❌ 请设置环境变量 EMAIL 和 PASSWORD")
     sys.exit(1)
+
+# 获取当前出口IP
+def get_current_ip(proxy_server=None):
+    proxies = {"http": proxy_server, "https": proxy_server} if (proxy_server and IS_PROXY) else None
+    try:
+        resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+        if resp.status_code == 200:
+            return resp.text.strip()
+        return "获取失败"
+    except Exception as e:
+        print(f"❌ 获取出口IP失败: {e}")
+        return "获取失败"
 
 # 点击续期按钮
 def click_extend_button(sb):
@@ -37,7 +57,10 @@ def click_extend_button(sb):
         print("✅ 通过 JavaScript 点击成功")
         return True, {}
     except Exception as e:
-        return False, {"error": str(e)}
+        err = str(e)
+        # 服务商只有到期前半小时才会显示 Extend 按钮，找不到按钮多半是还没到时间，而不是真的出错
+        not_time = "was not found" in err or "NoSuchElement" in err
+        return False, {"error": err, "not_time": not_time}
 
 # 检查续期是否成功
 def check_renewal_success(sb):
@@ -80,9 +103,32 @@ def check_renewal_success(sb):
 def send_tg(token, chat_id, message):
     if not token or not chat_id:
         return
+    message = f"【TheRose Cloud】\n{message}"
+
+    # 如果本地有 logo.png，就用 sendPhoto 把图片和文字一起发出去，更好看
+    if os.path.exists(LOGO_PATH):
+        url = f"https://api.telegram.org/bot{token}/sendPhoto"
+        try:
+            with open(LOGO_PATH, "rb") as f:
+                resp = requests.post(
+                    url,
+                    data={"chat_id": chat_id, "caption": message},
+                    files={"photo": f},
+                    timeout=15,
+                    proxies=REQUESTS_PROXIES,
+                )
+            if resp.status_code == 200:
+                print("📨 Telegram 通知已发送（带 logo）")
+                return
+            else:
+                print(f"⚠️ 带 logo 发送失败，回退为纯文字: {resp.text}")
+        except Exception as e:
+            print(f"⚠️ 带 logo 发送异常，回退为纯文字: {e}")
+
+    # 没有 logo 或者发送图片失败时，退回普通文字通知
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
-        resp = requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
+        resp = requests.post(url, json={"chat_id": chat_id, "text": message}, timeout=10, proxies=REQUESTS_PROXIES)
         if resp.status_code == 200:
             print("📨 Telegram 通知已发送")
         else:
@@ -109,19 +155,39 @@ def login(sb, email, password):
         # sb.save_screenshot("turnstile_passed.png")
     except Exception as e:
         print(f"⚠️ uc_gui_click_captcha 执行异常: {e}")
-    print("🔑 点击登录按钮...")
-    sb.uc_click('button:contains("Sign in")')
-    sb.sleep(3)
-    for _ in range(30):
-        # 判断是否登录成功
-        current_url = sb.get_current_url()
-        page_title = sb.get_title() or ""
-        print(f"📄 当前 URL: {current_url} | Title: {page_title}")
-        if "panel" in current_url:
-            print("✅ 登录成功，已跳转到 Dashboard")
-            # sb.save_screenshot("login_success.png")
-            return True, current_url
-        time.sleep(1)
+    # Turnstile 显示"成功"后 token 需要一点时间写入隐藏字段，
+    # 点太快会导致表单被前端拦截（不报错，原地不动），所以这里先等一下
+    print("⏳ 等待验证 token 生效...")
+    sb.sleep(2)
+
+    for attempt in range(3):
+        print(f"🔑 点击登录按钮...(第 {attempt + 1} 次)")
+        try:
+            sb.uc_click('button:contains("Sign in")')
+        except Exception as e:
+            print(f"⚠️ 点击异常: {e}")
+
+        # 分批检测，不再一次性死等30秒
+        for _ in range(5):
+            current_url = sb.get_current_url()
+            if "panel" in current_url:
+                print("✅ 登录成功，已跳转到 Dashboard")
+                return True, current_url
+            time.sleep(1)
+
+        # 检查页面是否出现错误提示（账号密码错误等），有的话直接停止重试
+        try:
+            err_selectors = ['.alert-danger', 'div[role="alert"].alert-danger', '.text-danger']
+            for sel in err_selectors:
+                if sb.is_element_visible(sel):
+                    err_text = sb.get_text(sel)
+                    print(f"❌ 登录出现错误提示: {err_text}")
+                    sb.save_screenshot("login_faild.png")
+                    return False, sb.get_current_url()
+        except Exception:
+            pass
+
+        print("⚠️ 未跳转，可能是点击未生效或 token 还未就绪，准备重试...")
 
     print(f"❌ 登录失败，当前 URL: {sb.get_current_url()}")
     sb.save_screenshot("login_faild.png")
@@ -131,7 +197,20 @@ def login(sb, email, password):
 def main():
     print("🚀 启动浏览器")
 
-    with SB(uc=True, headless=False) as sb:
+    if IS_PROXY:
+        print(f"⚙️ 代理已启用: {PROXY_SERVER}")
+    else:
+        print("🌐 直连模式（未使用代理）")
+
+    # 获取当前出口IP
+    current_ip = get_current_ip(PROXY_SERVER)
+    print(f"🎯 当前出口IP: {current_ip}")
+
+    sb_kwargs = {"uc": True, "headless": False}
+    if IS_PROXY:
+        sb_kwargs["proxy"] = PROXY_SERVER
+
+    with SB(**sb_kwargs) as sb:
         success, url = login(sb, EMAIL, PASSWORD)
         
         if not success:
@@ -145,8 +224,12 @@ def main():
         # 点击 Extend 按钮
         ok, info = click_extend_button(sb)
         if not ok:
-            msg = f"❌ 点击 Extend 按钮失败: {info.get('error')}"
-            print(msg)
+            if info.get("not_time"):
+                msg = "⏳ 未到续期时间，Extend 按钮尚未出现（一般到期前半小时才会开放），本次跳过"
+                print(msg)
+            else:
+                msg = f"❌ 点击 Extend 按钮失败: {info.get('error')}"
+                print(msg)
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg)
             return
         
