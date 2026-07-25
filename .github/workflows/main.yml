@@ -3,7 +3,7 @@ name: Auto Renew therose
 on:
   workflow_dispatch:
   schedule:
-    - cron: '45 11,23 * * *' # 北京时间每天 11:45 和 23:45 运行（GitHub Actions 使用 UTC）
+    - cron: '59 11,23 * * *' # UTC 时间每天 11:59 和 23:59 运行（即北京时间 19:59 和 07:59）
 
 permissions:
   actions: write
